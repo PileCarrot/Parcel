@@ -1,0 +1,12 @@
+/data/
+/dist/
+/build/
+/legacy/*.json
+/tests/*.json
+/tests/backups/
+**/__pycache__/
+*.py[cod]
+*.log
+*.notion.json
+.env
+.env.*
