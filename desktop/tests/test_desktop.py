@@ -1,12 +1,14 @@
 """Exercise native widget lifecycle and persisted timer boundaries with isolated data."""
 import gc
+import json
 import tempfile
 import unittest
 from concurrent.futures import Future
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from parcel import App, FloatTimer, StartDialog, TaskDialog, SettingsDialog, EventDialog
+from parcel import App, Dialog, FloatTimer, StartDialog, TaskDialog, SettingsDialog, EventDialog
 from parcel_core import Store, Clock, iso, now
 from parcel_notion import NotionSync, RemoteRow, project
 from test_core import task
@@ -48,6 +50,59 @@ class DesktopTests(unittest.TestCase):
         for form in [TaskDialog(self.app, self.app.data), SettingsDialog(self.app, self.app.cfg), EventDialog(self.app)]:
             form.update()
             form.destroy()
+
+    def test_feedback_button_saves_multiline_feedback_separately(self):
+        footer = self.app.winfo_children()[-1]
+        next(widget for widget in footer.winfo_children() if widget.cget('text') == '问题与反馈').invoke()
+        dialog = next(widget for widget in self.app.winfo_children() if isinstance(widget, Dialog))
+        controls = dialog.winfo_children()[-1]
+        submit = next(widget for widget in controls.winfo_children() if widget.cget('text') == '提交')
+        with patch('parcel.mb.showwarning') as warning:
+            submit.invoke()
+            warning.assert_called_once()
+        folder = self.store.path.with_suffix('.feedback')
+        self.assertFalse(folder.exists())
+
+        text = next(widget for widget in dialog.body.winfo_children() if widget.winfo_class() == 'Text')
+        text.insert('1.0', '建议增加快捷键\n第二行说明')
+        submit.invoke()
+        feedback, = folder.glob('*.json')
+        record = json.loads(feedback.read_text(encoding='utf-8'))
+        self.assertEqual(record['message'], '建议增加快捷键\n第二行说明')
+        self.assertTrue(record['created_at'])
+        self.assertFalse(dialog.winfo_exists())
+
+    def test_task_form_suggests_a_type_and_respects_manual_selection(self):
+        form = TaskDialog(self.app, self.app.data)
+        form.title_e.insert(0, '看几篇论文')
+        self.assertIn('输入', form.kind_hint.cget('text'))
+        form.save()
+        self.assertEqual(form.result['task_type'], '输入')
+
+        form = TaskDialog(self.app, self.app.data, initial={'title': '完善项目概念'})
+        form.kind.set('输入')
+        form.save()
+        self.assertEqual(form.result['task_type'], '输入')
+
+        form = TaskDialog(self.app, self.app.data, task=task(title='看论文', task_type='普通'))
+        form.save()
+        self.assertEqual(form.result['task_type'], '普通')
+
+    def test_energy_status_expires_in_ui_and_survives_replanning(self):
+        start = now().replace(microsecond=0)
+        expires = start + timedelta(hours=1)
+        with patch('parcel.now', return_value=start):
+            self.app.energy.set('高精力')
+            self.app.change_energy()
+        self.assertEqual(Store(self.store.path).data['settings']['energy_until'], iso(expires))
+        with patch('parcel.now', return_value=start + timedelta(minutes=30)):
+            self.app.replan(periodic=True)
+            self.assertEqual(self.app.energy.get(), '高精力')
+            self.assertEqual(self.app.cfg['energy_until'], iso(expires))
+        with patch('parcel.now', return_value=expires):
+            self.app.replan(periodic=True)
+            self.assertEqual(self.app.energy.get(), '正常')
+            self.assertIsNone(self.app.energy_expiry)
 
     def test_notion_cycle_persists_online_rows_and_keeps_local_tasks(self):
         parent = '00000000-0000-0000-0000-000000000001'

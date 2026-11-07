@@ -17,6 +17,34 @@ from zoneinfo import ZoneInfo
 ZONE = ZoneInfo('Europe/London')
 BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 POMODORO_MINUTES = 25
+ENERGY_WINDOW_MINUTES = 60
+ENERGY_STATES = ('正常', '高精力', '低精力')
+WORK_STATES = ('正常', '输入', '输出', '休闲')
+CONTEXTS = ('任意', '宿舍', '校内', '车程', '其他')
+
+TASK_TYPE_CUES = {
+    '输入': re.compile(
+        r'(?:看|读|阅读|精读|浏览|查阅)(?:完|了)?\s*(?:[几数\d一二两三四五六七八九十]+\s*)?'
+        r'(?:篇|份|个|本|节|套)?\s*(?:相关)?(?:论文|文献|教程|资料|课件|书|视频)'
+        r'|(?:论文|文献)阅读|看课|听课|看讲座|听讲座|查资料|了解|学习.{0,12}教程'
+        r'|\b(?:read(?:ing)?|watch(?:ing)?)\s+(?:[\w-]+\s+){0,3}'
+        r'(?:papers?|articles?|tutorials?|lectures?)\b', re.IGNORECASE),
+    '输出': re.compile(
+        r'完善|修改|撰写|编写|写(?:论文|报告|综述|作业|文案|反思|笔记|提案)|'
+        r'画(?:草图|线框|流程图|概念图)|制作|绘制|建模|排版|出图|做(?:原型|模型|海报|演示|作品集)|'
+        r'设计(?:原型|界面|海报|问卷|方案)|\b(?:write|draft|revise|prototype|sketch)\b',
+        re.IGNORECASE),
+}
+
+
+def suggest_task_type(title, description=''):
+    """Use clear action cues in the title, then fall back to the description."""
+    title = re.sub(r'^\s*\[[^\]]+\]\s*', '', title)
+    for text in (title, description):
+        matches = [kind for kind, pattern in TASK_TYPE_CUES.items() if pattern.search(text)]
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+    return None
 
 
 def now():
@@ -50,6 +78,31 @@ def iso(value):
     return value.isoformat(timespec='seconds')
 
 
+def current_preference(cfg, at, key):
+    mode = cfg.get(key)
+    states = ENERGY_STATES if key == 'energy' else WORK_STATES
+    if mode not in states[1:]:
+        return '正常', None
+    try:
+        until = parse_dt(cfg.get(f'{key}_until'))
+    except ValueError:
+        until = None
+    return (mode, until) if until and at < until else ('正常', None)
+
+
+def energy_rank(mode, task):
+    energy = task.get('energy')
+    if mode == '高精力':
+        return int(energy != '高')
+    if mode == '低精力':
+        return {'低': 0, '高': 2}.get(energy, 1)
+    return 0
+
+
+def category_priority(data, task):
+    return data.get('category_priorities', {}).get(task.get('category'), 3)
+
+
 def hm(value):
     return datetime.strptime(value, '%H:%M').time()
 
@@ -67,7 +120,7 @@ def default_settings():
         'availability': {str(i): [['08:00', '12:00'], ['19:00', '22:00']] if i < 5 else
                          [['10:00', '12:00'], ['14:00', '17:00'], ['19:00', '22:00']] for i in range(7)},
         'reserve_enabled': True, 'reserve_start': '21:00', 'reserve_end': '22:00',
-        'energy': '正常', 'context': '',
+        'energy': '正常', 'energy_until': '', 'work_type': '正常', 'work_type_until': '', 'context': '',
     }
 
 
@@ -90,6 +143,9 @@ class Store:
                 self.import_legacy()
         defaults = default_settings()
         defaults.update(self.data.get('settings', {}))
+        if defaults['energy'] in ('适合输入', '适合输出'):
+            defaults.update(work_type=defaults['energy'][2:], work_type_until=defaults['energy_until'],
+                            energy='正常', energy_until='')
         self.data['settings'] = defaults
         if self.new:
             self.save()
@@ -144,6 +200,25 @@ class Store:
             os.fsync(f.fileno())
         os.replace(temp, self.path)
 
+    def submit_feedback(self, message):
+        message = message.strip()
+        if not message:
+            raise ValueError('请先填写反馈。')
+        folder = self.path.with_suffix('.feedback')
+        folder.mkdir(exist_ok=True)
+        target = folder / f'{uid()}.json'
+        temp = target.with_suffix('.tmp')
+        record = {'created_at': iso(now()), 'message': message}
+        temp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
+        temp.replace(target)
+
+    def course_events(self):
+        path = self.path.with_suffix('.courses.json')
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return []
+
 
 def subtract(intervals, blocks):
     result = list(intervals)
@@ -187,15 +262,18 @@ def event_instances(events, start_day, days):
                 end += timedelta(days=1)
             output.append({'id': e['id'] + ':' + str(day), 'event_id': e['id'],
                            'kind': 'fixed', 'title': e.get('title', e.get('name', '固定日程')),
+                           'course': e.get('course', False),
                            'start': iso(start), 'end': iso(end)})
     return output
 
 
-def schedule(data, at=None):
+def schedule(data, at=None, *, courses=()):
     """Schedule EDF with dependency urgency propagation. Never schedule past a deadline."""
     at = (at or now()).replace(microsecond=0)
     at = at.replace(second=0) + (timedelta(minutes=1) if at.second else timedelta())
     cfg = data['settings']
+    energy_mode, energy_until = current_preference(cfg, at, 'energy')
+    work_mode, work_until = current_preference(cfg, at, 'work_type')
     days = int(cfg['horizon_days'])
     horizon = datetime.combine(at.date() + timedelta(days=days), time())
     all_tasks = {t['id']: t for t in data['tasks']}
@@ -238,7 +316,8 @@ def schedule(data, at=None):
         if not changed:
             break
 
-    fixed = event_instances(data.get('events', []), at.date() - timedelta(days=1), days + 1)
+    events = [*data.get('events', []), *courses]
+    fixed = event_instances(events, at.date() - timedelta(days=1), days + 1)
     fixed = [b for b in fixed if parse_dt(b['end']) > at and parse_dt(b['start']) < horizon]
     blocks = list(fixed)
     conflicts = []
@@ -323,6 +402,8 @@ def schedule(data, at=None):
     for slot_start, slot_end in slots:
         cursor = max(slot_start, next_work_start)
         while cursor < slot_end:
+            mode = energy_mode if energy_until and cursor < energy_until else '正常'
+            work_preference = work_mode if work_until and cursor < work_until else '正常'
             candidates, next_release = [], []
             for k, t in tasks.items():
                 if rem[k] < .01 or k in errors:
@@ -354,12 +435,10 @@ def schedule(data, at=None):
                 if duration < minimum:
                     continue
                 soft = (int(t.get('energy') == '高' and previous_energy == '高') +
-                        int(cfg.get('energy') == '低精力' and t.get('energy') == '高') +
-                        int(t.get('task_type') == previous_type and previous_type in ('输入', '输出')) +
-                        int(cfg.get('energy') == '适合输入' and t.get('task_type') == '输出') +
-                        int(cfg.get('energy') == '适合输出' and t.get('task_type') == '输入'))
+                        int(t.get('task_type') == previous_type and previous_type in ('输入', '输出')))
                 # Deadline and priority always outrank energy/type alternation.
-                rank = (urgency[k], -int(t.get('priority', 3)), soft,
+                type_rank = int(work_preference != '正常' and t.get('task_type') != work_preference)
+                rank = (urgency[k], -category_priority(data, t), energy_rank(mode, t) + type_rank, soft,
                         0 if (k, iso(cursor)) in old else 1, 0 if k == previous_task else 1, k)
                 candidates.append((rank, k, duration))
             if not candidates:

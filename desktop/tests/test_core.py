@@ -4,7 +4,9 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from parcel_core import Clock, Store, default_settings, schedule, iso, parse_dt, quick_parse, next_half_hour_delay
+from parcel_core import (Clock, Store, default_settings, schedule, iso, parse_dt,
+                         quick_parse, suggest_task_type, next_half_hour_delay)
+from parcel_courses import import_courses
 
 AT = datetime(2026, 11, 5, 9)
 
@@ -80,8 +82,50 @@ class SchedulingTests(unittest.TestCase):
 
     def test_deadline_outranks_energy_alternation(self):
         data = dataset(task('a', minutes=50, energy='高', due='2026-11-05 10:00'), task('b', minutes=25, energy='低'))
-        data['settings']['energy'] = '低精力'
+        data['settings'].update(energy='低精力', energy_until=iso(AT + timedelta(hours=1)))
         self.assertEqual([b['task_id'] for b in work(schedule(data, AT))[:2]], ['a', 'a'])
+
+    def test_state_preference_only_applies_before_expiry(self):
+        for key, mode, fields in [('energy', '低精力', {'energy': '低', 'task_type': '输出'}),
+                                  ('energy', '高精力', {'energy': '高'}),
+                                  ('work_type', '输入', {'task_type': '输入'}),
+                                  ('work_type', '输出', {'task_type': '输出'})]:
+            with self.subTest(mode=mode):
+                data = dataset(task('a', minutes=125), task('b', minutes=125, **fields))
+                expires = AT + timedelta(hours=1)
+                data['settings'].update({key: mode, f'{key}_until': iso(expires)})
+                blocks = work(schedule(data, AT))
+                self.assertEqual([b['task_id'] for b in blocks[:3]], ['b', 'b', 'a'])
+                self.assertEqual(blocks[2]['start'], iso(expires))
+                self.assertEqual(work(schedule(data, AT + timedelta(minutes=30)))[1]['task_id'], 'a')
+                self.assertEqual(work(schedule(data, expires))[0]['task_id'], 'a')
+                del data['settings'][f'{key}_until']
+                self.assertEqual(work(schedule(data, AT))[0]['task_id'], 'a')
+
+    def test_preferences_combine_and_use_category_priority(self):
+        data = dataset(task('a', minutes=25, energy='高', task_type='输入', category='A', priority=5),
+                       task('b', minutes=25, energy='高', task_type='输出', category='B'))
+        until = iso(AT + timedelta(hours=1))
+        data['settings'].update(energy='高精力', energy_until=until, work_type='输出', work_type_until=until)
+        self.assertEqual(work(schedule(data, AT))[0]['task_id'], 'b')
+        data['category_priorities'] = {'A': 4}
+        self.assertEqual(work(schedule(data, AT))[0]['task_id'], 'a')
+
+    def test_course_snapshot_replaces_only_the_requested_range_and_blocks_work(self):
+        event = dict(id='1', summary='DESE71003 – Sensing and Internet of Things',
+                     start='2026-11-05T09:00:00Z', end='2026-11-05T10:00:00Z')
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as root:
+            store = Store(Path(root) / 'parcel.json')
+            path = store.path.with_suffix('.courses.json')
+            self.assertEqual(import_courses(path, [event], AT.date(), AT.date()+timedelta(days=1)), (1, True))
+            courses = store.course_events()
+            self.assertEqual(courses[0]['title'], 'IoT')
+            plan = schedule(dataset(task(minutes=25)), AT, courses=courses)
+            self.assertEqual(work(plan)[0]['start'], '2026-11-05T10:00:00')
+            self.assertTrue(plan['blocks'][0]['course'])
+            self.assertEqual(import_courses(path, [], AT.date()+timedelta(days=1), AT.date()+timedelta(days=2)), (0, False))
+            self.assertEqual(import_courses(path, [], AT.date(), AT.date()+timedelta(days=1)), (0, True))
+            self.assertEqual(store.course_events(), [])
 
     def test_remaining_work_and_completed_history_not_mutated(self):
         data = dataset(task(minutes=100, worked_minutes=50))
@@ -186,6 +230,14 @@ class ClockAndDataTests(unittest.TestCase):
         self.assertEqual(result['due'], '2026-11-06')
         self.assertEqual(result['estimated_minutes'], 120)
         self.assertEqual(result['title'], '画草图')
+
+    def test_task_type_suggestions_require_unambiguous_action_cues(self):
+        self.assertEqual(suggest_task_type('[IoT] 完善 IoT 项目概念'), '输出')
+        self.assertEqual(suggest_task_type('看几篇论文'), '输入')
+        self.assertEqual(suggest_task_type('Contextual Design 相关6篇论文阅读'), '输入')
+        self.assertEqual(suggest_task_type('课程作业', 'Read 3 papers'), '输入')
+        self.assertIsNone(suggest_task_type('阅读论文并撰写综述', '写报告'))
+        self.assertIsNone(suggest_task_type('Contextual Design'))
 
 
 if __name__ == '__main__':

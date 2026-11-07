@@ -17,9 +17,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import ttk, messagebox as mb, simpledialog as sd, filedialog
 
-from parcel_core import (BASE, POMODORO_MINUTES, Store, Clock, now, iso, parse_dt, remaining,
-                         schedule, uid, hm, quick_parse, next_half_hour_delay)
+from parcel_core import (BASE, POMODORO_MINUTES, CONTEXTS, ENERGY_STATES, WORK_STATES, ENERGY_WINDOW_MINUTES,
+                         Store, Clock, now, iso, parse_dt, remaining, schedule, uid, hm,
+                         quick_parse, suggest_task_type, current_preference, category_priority, next_half_hour_delay)
 from parcel_notion import NotionSync, SyncError, reconcile
+from parcel_bridge import Bridge
 
 CREAM = '#F5F3EB'
 PAPER = '#FFFEF9'
@@ -27,6 +29,7 @@ MINT = '#98DCCB'
 PALE = '#E7F3EC'
 GREEN = '#276451'
 ORANGE = '#F47A40'
+COURSE_ORANGE = '#E7A12B'
 TEXT = '#293D36'
 MUTED = '#7C847A'
 LINE = '#DFE3D8'
@@ -141,10 +144,11 @@ class Dialog(tk.Toplevel):
         self.geometry(f'+{x}+{max(30, owner.winfo_rooty()+65)}')
         self.grab_set()
 
-    def field(self, text, value='', values=None):
+    def field(self, text, value='', values=None, *, parent=None):
         row = self.column
-        label(self.body, text).grid(row=row, column=0, sticky='w', pady=5, padx=(0, 16))
-        w = ttk.Combobox(self.body, values=values, font=(FONT, 10), width=37) if values is not None else entry(self.body, value, 39)
+        parent = self.body if parent is None else parent
+        label(parent, text).grid(row=row, column=0, sticky='w', pady=5, padx=(0, 16))
+        w = ttk.Combobox(parent, values=values, font=(FONT, 10), width=37) if values is not None else entry(parent, value, 39)
         if values is not None:
             w.set(value)
         w.grid(row=row, column=1, sticky='ew', pady=5)
@@ -162,6 +166,8 @@ class Dialog(tk.Toplevel):
 
 
 class TaskDialog(Dialog):
+    AUTO_TYPE = '自动建议'
+
     def __init__(self, owner, data, task=None, initial=None):
         super().__init__(owner, '编辑待办' if task else '新增待办')
         self.data = data
@@ -172,15 +178,38 @@ class TaskDialog(Dialog):
         self.title_e = self.field('具体工作', t.get('title', ''))
         self.category = self.field('大类', t.get('category', data['categories'][0] if data['categories'] else '通用'), data['categories'])
         self.estimate = self.field('预计总番茄数', f'{t.get("estimated_minutes", 25) / POMODORO_MINUTES:.12g}')
-        self.worked = self.field('已投入番茄数', f'{t.get("worked_minutes", 0) / POMODORO_MINUTES:.12g}')
         self.due = self.field('截止日期（可留空）', t.get('due', ''))
-        self.earliest = self.field('最早开始（可留空）', t.get('earliest', ''))
-        self.priority = self.field('优先级（5 最高）', t.get('priority', 3), [1, 2, 3, 4, 5])
-        self.minimum = self.field('最短连续工作（分钟）', t.get('min_session', min(25, t.get('estimated_minutes', 25))))
-        self.kind = self.field('任务类型', t.get('task_type', '普通'), ['普通', '输入', '输出', '低负荷'])
+        default_kind = '普通' if task else self.AUTO_TYPE
+        self.kind = self.field('任务类型', t.get('task_type', default_kind),
+                               [self.AUTO_TYPE, '普通', '输入', '输出', '低负荷', '休闲'])
+        self.kind.configure(state='readonly')
+        self.kind_hint = label(self.body, '', size=9, color=MUTED)
+        self.kind_hint.grid(row=self.column, column=1, sticky='w')
+        self.column += 1
         self.energy = self.field('所需精力', t.get('energy', '正常'), ['低', '正常', '高'])
-        self.context = self.field('地点 / 环境（可留空）', t.get('context', ''))
-        self.description = self.field('任务描述（可留空）', t.get('description', ''))
+        extra_row = self.column
+        extras = frame(self.body, CREAM)
+        self.column += 2
+        self.worked = self.field('已投入番茄数', f'{t.get("worked_minutes", 0) / POMODORO_MINUTES:.12g}', parent=extras)
+        self.earliest = self.field('最早开始（可留空）', t.get('earliest', ''), parent=extras)
+        self.default_minimum = min(25, t.get('estimated_minutes', 25))
+        self.minimum = self.field('最短连续工作（分钟）', t.get('min_session', self.default_minimum), parent=extras)
+        context = t.get('context') or '任意'
+        options = CONTEXTS if context in CONTEXTS else (*CONTEXTS, context)
+        self.context = self.field('地点 / 环境', context, options, parent=extras)
+        self.context.configure(state='readonly')
+        self.description = self.field('任务描述（可留空）', t.get('description', ''), parent=extras)
+        toggle = button(self.body, '其他设置 ▸', lambda: self.toggle_extras(extras, toggle), subtle=True)
+        toggle.grid(row=extra_row, column=0, columnspan=2, sticky='w')
+        extras.grid(row=extra_row+1, column=0, columnspan=2, sticky='w')
+        extras.grid_remove()
+        self.classification_text = []
+        for widget in (self.title_e, self.description):
+            value = tk.StringVar(self, value=widget.get())
+            widget.configure(textvariable=value)
+            value.trace_add('write', self.update_kind_hint)
+            self.classification_text.append(value)
+        self.update_kind_hint()
         label(self.body, '前置任务（按住 Ctrl 多选）').grid(row=self.column, column=0, sticky='nw', pady=5, padx=(0, 12))
         host = frame(self.body)
         host.grid(row=self.column, column=1, sticky='ew', pady=5)
@@ -203,6 +232,23 @@ class TaskDialog(Dialog):
             button(footer, '已完成', self.request_complete).pack(side='left', padx=8)
         self.title_e.focus_set()
 
+    def update_kind_hint(self, *args):
+        suggestion = suggest_task_type(self.title_e.get(), self.description.get())
+        if suggestion:
+            hint = f'本地建议：{suggestion}'
+        else:
+            hint = '类型不明确，自动建议将使用「普通」'
+        self.kind_hint.configure(text=hint)
+
+    @staticmethod
+    def toggle_extras(extras, toggle):
+        if extras.winfo_manager():
+            extras.grid_remove()
+            toggle.configure(text='其他设置 ▸')
+        else:
+            extras.grid()
+            toggle.configure(text='其他设置 ▾')
+
     def request_complete(self):
         self.complete_requested = True
         self.destroy()
@@ -219,15 +265,14 @@ class TaskDialog(Dialog):
             estimate = round(float(self.estimate.get()) * POMODORO_MINUTES, 4)
             worked = round(float(self.worked.get()) * POMODORO_MINUTES, 4)
             minimum = float(self.minimum.get())
+            if not self.task and minimum == self.default_minimum:
+                minimum = min(minimum, estimate)
             if not all(map(math.isfinite, (estimate, worked, minimum))) or estimate <= 0 or worked < 0 or not .1 <= minimum <= estimate:
                 raise ValueError('总工时须大于 0，已投入不能小于 0；最短时长须大于 0 且不超过总工时')
             due, earliest = self.due.get().strip(), self.earliest.get().strip()
             deadline, release = parse_dt(due, True), parse_dt(earliest)
             if deadline and release and release >= deadline:
                 raise ValueError('最早开始必须早于截止日期')
-            priority = int(self.priority.get())
-            if not 1 <= priority <= 5:
-                raise ValueError('优先级请填写 1 至 5')
             deps = [self.options[i]['id'] for i in self.dependencies.curselection()]
             if self.task:
                 graph = {a['id']: a.get('dependencies', []) for a in self.data['tasks']}
@@ -241,11 +286,16 @@ class TaskDialog(Dialog):
                 if any(reaches(k, set()) for k in deps):
                     raise ValueError('这些前置任务会形成循环依赖')
             already_done = bool(self.task and self.task.get('done'))
+            description = self.description.get().strip()
+            kind = self.kind.get()
+            if kind == self.AUTO_TYPE:
+                kind = suggest_task_type(title, description) or '普通'
             self.result = dict(title=title, category=self.category.get().strip() or '通用',
                                estimated_minutes=estimate, worked_minutes=worked, min_session=minimum,
-                               due=due, earliest=earliest, priority=priority, dependencies=deps,
-                               task_type=self.kind.get(), energy=self.energy.get(), context=self.context.get().strip(),
-                               description=self.description.get().strip(), done=already_done or worked >= estimate)
+                               due=due, earliest=earliest, dependencies=deps,
+                               task_type=kind, energy=self.energy.get(),
+                               context='' if self.context.get() == '任意' else self.context.get(),
+                               description=description, done=already_done or worked >= estimate)
             self.destroy()
         except ValueError as exc:
             mb.showwarning('检查任务', str(exc), parent=self)
@@ -282,8 +332,11 @@ class SettingsDialog(Dialog):
         self.rs.pack(side='left')
         self.re = entry(times, cfg['reserve_end'], 6)
         self.re.pack(side='left', padx=5)
-        label(planner, '当前地点 / 环境（留空表示不限）').grid(row=3, column=0, sticky='w', pady=10)
-        self.context = entry(planner, cfg.get('context', ''), 18)
+        label(planner, '当前地点 / 环境').grid(row=3, column=0, sticky='w', pady=10)
+        context = cfg.get('context') or '任意'
+        contexts = CONTEXTS if context in CONTEXTS else (*CONTEXTS, context)
+        self.context = ttk.Combobox(planner, values=contexts, state='readonly', width=17)
+        self.context.set(context)
         self.context.grid(row=3, column=1, padx=15)
         label(planner, '地点已指定的任务只在相同环境下排程。\n截止日期无法满足时显示冲突，不占用休闲保护时间。\n应用时间：Europe/London（自动处理夏令时）。', size=9, color=MUTED, justify='left').grid(row=4, column=0, columnspan=2, sticky='w', pady=20)
         self.availability = []
@@ -325,7 +378,7 @@ class SettingsDialog(Dialog):
                 availability[str(i)] = spans
             self.cfg.update(horizon_days=horizon, auto_next=self.auto.get(), force_note=self.force_note.get(),
                             reserve_enabled=self.reserve.get(), reserve_start=self.rs.get(), reserve_end=self.re.get(),
-                            context=self.context.get().strip(), availability=availability)
+                            context='' if self.context.get() == '任意' else self.context.get(), availability=availability)
             self.result = self.cfg
             self.destroy()
         except (ValueError, TypeError):
@@ -509,6 +562,8 @@ class FloatTimer(tk.Toplevel):
         self.snapshot()
         self.app.persist()
         self.withdraw()
+        if self.app.timer_only and not self.app.tray_ready:
+            self.app.show()
         self.app.status.set('番茄钟仍在计时。点击“打开番茄钟”可再次显示。')
 
     def snapshot(self):
@@ -624,7 +679,7 @@ class FloatTimer(tk.Toplevel):
 
 
 class App(tk.Tk):
-    def __init__(self, store=None, tray=True):
+    def __init__(self, store=None, tray=True, timer_only=False):
         super().__init__()
         self.title('Parcel · 日程与专注')
         self.configure(bg=CREAM)
@@ -644,7 +699,12 @@ class App(tk.Tk):
         self.notion_future = None
         self.notion_upload_count = 0
         self.cfg = self.data['settings']
+        self.energy_expiry = None
+        self.courses = []
         self.timer = None
+        self.timer_only = timer_only
+        self.preparation = None
+        self.bridge = None
         self.tray = None
         self.tray_ready = False
         self.actions = queue.Queue()
@@ -667,6 +727,10 @@ class App(tk.Tk):
         self.start_notion_sync()
         self.after(next_half_hour_delay(), self.refresh_tick)
         self.after(300, self.poll_actions)
+        try:
+            self.bridge = Bridge(self, self.store.path.parent)
+        except OSError:
+            self.status.set('Intercept 本地桥接端口不可用；Parcel 番茄钟仍可正常使用。')
         if tray:
             self.install_tray()
 
@@ -692,7 +756,7 @@ class App(tk.Tk):
         actions = frame(self, CREAM)
         actions.pack(fill='x', padx=26, pady=(8, 8))
         for text, command, accent in [('打开番茄钟', self.open_timer, True), ('新增待办', self.add_task, False),
-                                      ('新增大类', self.add_category, False), ('固定日程', self.events_window, False),
+                                      ('大类设置', self.add_category, False), ('固定日程', self.events_window, False),
                                       ('计时 / 排程设置', self.settings, False)]:
             button(actions, text, command, accent=accent).pack(side='left', padx=(0, 8))
         more = tk.Menubutton(actions, text='更多 ▾', bg=CREAM, fg=GREEN, font=(FONT, 10), relief='flat', padx=10, pady=7)
@@ -745,6 +809,19 @@ class App(tk.Tk):
         label(task_head, '待办事项', size=15, bold=True).pack(side='left')
         tk.Checkbutton(task_head, text='显示已完成', variable=self.show_done, command=self.render_tasks,
                        bg=PAPER, fg=MUTED, activebackground=PAPER, font=(FONT, 9)).pack(side='right')
+        filter_host = frame(task_panel)
+        filter_host.pack(fill='x', padx=16)
+        filter_body = frame(filter_host)
+        toggle = button(filter_host, '筛选 ▸', lambda: self.toggle_task_filters(filter_body, toggle), subtle=True, small=True)
+        toggle.pack(anchor='w')
+        self.task_filters = {}
+        for i, (key, title) in enumerate([('高', '高精力'), ('低', '低精力'), ('输入', '输入式工作'),
+                                          ('输出', '输出式工作'), ('休闲', '休闲')]):
+            var = tk.BooleanVar(value=key != '休闲')
+            self.task_filters[key] = var
+            tk.Checkbutton(filter_body, text=title, variable=var, command=self.render_tasks,
+                           bg=PAPER, fg=TEXT, activebackground=PAPER, font=(FONT, 9)
+                           ).grid(row=i//2, column=i%2, sticky='w')
         self.task_area = ScrollArea(task_panel)
         self.task_area.pack(fill='both', expand=True, padx=12, pady=(8, 10))
         head = frame(history_panel)
@@ -757,13 +834,18 @@ class App(tk.Tk):
         head.pack(fill='x', padx=16, pady=(15, 8))
         label(head, '自动排程', size=15, bold=True).pack(side='left')
         button(head, '重新安排', self.replan, subtle=True).pack(side='right')
-        energy_row = frame(plan_panel)
-        energy_row.pack(fill='x', padx=16, pady=(0, 8))
-        label(energy_row, '当前状态', size=9, color=MUTED).pack(side='left')
-        self.energy = ttk.Combobox(energy_row, state='readonly', width=10, values=['正常', '高精力', '低精力', '适合输入', '适合输出', '需要休息'])
-        self.energy.set(self.cfg['energy'])
-        self.energy.pack(side='left', padx=10)
-        self.energy.bind('<<ComboboxSelected>>', self.change_energy)
+        self.preferences = {}
+        for key, title, states in [('energy', '精力状态', ENERGY_STATES), ('work_type', '工作类型', WORK_STATES)]:
+            row = frame(plan_panel)
+            row.pack(fill='x', padx=16, pady=(0, 5))
+            label(row, title, size=9, color=MUTED).pack(side='left')
+            combo = ttk.Combobox(row, state='readonly', width=8, values=states)
+            combo.pack(side='left', padx=8)
+            combo.bind('<<ComboboxSelected>>', lambda event, key=key: self.change_energy(key=key))
+            hint = label(row, '', size=9, color=MUTED)
+            hint.pack(side='left')
+            self.preferences[key] = combo, hint
+        self.energy = self.preferences['energy'][0]
         self.health = button(plan_panel, '', self.show_conflicts, subtle=True, anchor='w')
         self.health.pack(fill='x', padx=10)
         self.health_meta = label(plan_panel, '', size=8, color=MUTED, anchor='w')
@@ -778,7 +860,31 @@ class App(tk.Tk):
         button(nav, '今天', self.today, subtle=True).pack(side='right')
         self.plan_area = ScrollArea(plan_panel)
         self.plan_area.pack(fill='both', expand=True, padx=12, pady=(10, 10))
-        label(self, textvariable=self.status, size=9, color=MUTED, anchor='w').pack(fill='x', padx=26, pady=(10, 13))
+        footer = frame(self, CREAM)
+        footer.pack(fill='x', padx=26, pady=(6, 8))
+        button(footer, '问题与反馈', self.feedback_window, subtle=True).pack(side='right')
+        label(footer, textvariable=self.status, size=9, color=MUTED, anchor='w').pack(side='left', fill='x', expand=True)
+
+    def feedback_window(self):
+        d = Dialog(self, '问题与反馈')
+        label(d.body, '遇到了什么问题？也可以写下想调整的地方。').pack(anchor='w')
+        text = tk.Text(d.body, width=54, height=7, wrap='word', bg=PAPER, fg=TEXT,
+                       font=(FONT, 10), padx=10, pady=8)
+        text.pack(fill='both', expand=True, pady=8)
+        label(d.body, '反馈会先保存在本机，供晚间批量处理。', size=9, color=MUTED).pack(anchor='w')
+
+        def submit():
+            try:
+                self.store.submit_feedback(text.get('1.0', 'end-1c'))
+            except (ValueError, OSError) as exc:
+                hint = str(exc) if isinstance(exc, ValueError) else '保存失败，请重试。'
+                mb.showwarning('反馈未提交', hint, parent=d)
+                return
+            d.destroy()
+            self.status.set('反馈已保存，等待晚间处理。')
+
+        d.footer(submit, '提交')
+        text.focus_set()
 
     def persist(self):
         # Serialize explicit changes with any in-flight timer snapshot.
@@ -804,7 +910,13 @@ class App(tk.Tk):
     def replan(self, *, periodic=False):
         if self.timer and self.timer.winfo_exists():
             self.timer.snapshot()
-        self.plan = schedule(self.data)
+        at = now()
+        self.render_energy(at)
+        try:
+            self.courses = self.store.course_events()
+        except (ValueError, OSError):
+            self.status.set('课表暂时无法读取，保留已加载的课程。')
+        self.plan = schedule(self.data, at, courses=self.courses)
         self.data['schedule'] = self.plan['blocks']
         if not periodic:
             self.persist()
@@ -916,10 +1028,22 @@ class App(tk.Tk):
         t = next((t for t in self.data['tasks'] if t['id'] == b['task_id'] and remaining(t) > 0), None)
         return t, b
 
+    @staticmethod
+    def toggle_task_filters(body, toggle):
+        if body.winfo_manager():
+            body.pack_forget()
+            toggle.configure(text='筛选 ▸')
+        else:
+            body.pack(anchor='w')
+            toggle.configure(text='筛选 ▾')
+
     def render_tasks(self):
         self.task_area.clear()
-        tasks = [t for t in self.data['tasks'] if self.show_done.get() or remaining(t) > 0]
-        tasks.sort(key=lambda t: (not bool(remaining(t)), parse_dt(t.get('due'), True) or datetime.max, -t.get('priority', 3)))
+        hidden = {key for key, var in self.task_filters.items() if not var.get()}
+        tasks = [t for t in self.data['tasks'] if (self.show_done.get() or remaining(t) > 0)
+                 and t.get('energy') not in hidden and t.get('task_type') not in hidden]
+        tasks.sort(key=lambda t: (not bool(remaining(t)), parse_dt(t.get('due'), True) or datetime.max,
+                                  -category_priority(self.data, t)))
         for t in tasks:
             host = frame(self.task_area.body)
             host.pack(fill='x', padx=5, pady=(0, 6))
@@ -941,7 +1065,7 @@ class App(tk.Tk):
             label(host, f'{pomodoro_text(t["worked_minutes"])} / {pomodoro_text(t["estimated_minutes"])} 个番茄', size=9, color=MUTED).pack(anchor='w')
             line(host)
         if not tasks:
-            label(self.task_area.body, '暂无待办。\n点击“新增待办”开始。', size=11, color=MUTED, justify='left').pack(anchor='w', padx=10, pady=20)
+            label(self.task_area.body, '没有符合筛选条件的待办。', size=11, color=MUTED).pack(anchor='w', padx=10, pady=20)
 
     def render_history(self):
         self.history_area.clear()
@@ -993,6 +1117,8 @@ class App(tk.Tk):
             outer = frame(self.plan_area.body, LINE, bd=0)
             outer.pack(fill='x', padx=5, pady=(0, 8))
             color = ORANGE if b['kind'] in ('work', 'active', 'pinned') else MINT if b['kind'] == 'reserve' else MUTED
+            if b.get('course'):
+                color = COURSE_ORANGE
             frame(outer, color, width=3).pack(side='left', fill='y')
             card = frame(outer, PALE if b['kind'] == 'active' else PAPER)
             card.pack(side='left', fill='both', expand=True, padx=1, pady=1)
@@ -1022,11 +1148,34 @@ class App(tk.Tk):
         self.selected_day = now().date()
         self.render_plan()
 
-    def change_energy(self, event=None):
-        self.cfg['energy'] = self.energy.get()
-        if self.energy.get() == '需要休息':
-            self.status.set('可以先休息，任务推荐会保留；已确认的固定日程保持原位。')
+    def change_energy(self, *, key='energy'):
+        mode = self.preferences[key][0].get()
+        until = now() + timedelta(minutes=ENERGY_WINDOW_MINUTES)
+        self.cfg[key] = mode
+        self.cfg[f'{key}_until'] = iso(until) if mode != '正常' else ''
         self.replan()
+
+    def render_energy(self, at):
+        if self.energy_expiry is not None:
+            self.after_cancel(self.energy_expiry)
+            self.energy_expiry = None
+        expiries = []
+        for key, (combo, hint) in self.preferences.items():
+            mode, until = current_preference(self.cfg, at, key)
+            combo.set(mode)
+            if until:
+                clock = until.strftime('%H:%M' if until.date() == at.date() else '%m/%d %H:%M')
+                hint.configure(text=f'生效至 {clock}')
+                expiries.append(until)
+            else:
+                hint.configure(text='偏好持续 1 小时')
+        if expiries:
+            delay = math.ceil((min(expiries) - at).total_seconds() * 1000)
+            self.energy_expiry = self.after(delay, self.expire_energy)
+
+    def expire_energy(self):
+        self.energy_expiry = None
+        self.replan(periodic=True)
 
     def add_task(self):
         d = TaskDialog(self, self.data)
@@ -1069,11 +1218,27 @@ class App(tk.Tk):
             self.replan()
 
     def add_category(self):
-        text = sd.askstring('新增大类', '大类名称：', parent=self)
-        if text and text.strip() and text.strip() not in self.data['categories']:
-            self.data['categories'].append(text.strip())
-            self.persist()
-            self.status.set(f'已添加大类：{text.strip()}')
+        d = Dialog(self, '大类设置')
+        categories = self.data['categories']
+        priorities = self.data.setdefault('category_priorities', {})
+        name = d.field('选择或输入大类', '', categories)
+        priority = d.field('优先级（5 最高）', 3, [1, 2, 3, 4, 5])
+        priority.configure(state='readonly')
+        name.bind('<<ComboboxSelected>>', lambda event: priority.set(priorities.get(name.get(), 3)))
+
+        def save():
+            category = name.get().strip()
+            if not category:
+                mb.showwarning('大类设置', '请输入大类名称。', parent=d)
+                return
+            if category not in categories:
+                categories.append(category)
+            priorities[category] = int(priority.get())
+            d.destroy()
+            self.replan()
+            self.status.set(f'已保存大类：{category}')
+
+        d.footer(save)
 
     def complete_task(self, task):
         if self.data.get('active') and self.data['active']['task_id'] == task['id']:
@@ -1119,6 +1284,64 @@ class App(tk.Tk):
             self.timer = FloatTimer(self, active)
             self.timer.clock.start()
             self.replan()
+
+    def intercept_command(self, command):
+        if self.timer and self.timer.winfo_exists():
+            self.open_timer()
+            return {'status': 'existing'}
+        if command == 'show':
+            self.start_recommended_intercept()
+            return {'status': 'shown'}
+        if self.preparation and self.preparation.winfo_exists():
+            self.preparation.lift()
+            return {'status': 'preparing'}
+        self.start_preparation()
+        return {'status': 'preparing'}
+
+    def start_preparation(self):
+        dialog = tk.Toplevel(self)
+        self.preparation = dialog
+        dialog.title('Parcel · 3 分钟准备')
+        dialog.configure(bg=CREAM)
+        dialog.attributes('-topmost', True)
+        dialog.geometry('390x310')
+        label(dialog, '开始专注前，准备一下', size=15, bold=True).pack(pady=(20, 8))
+        countdown = label(dialog, '03:00', size=24, color=ORANGE)
+        countdown.pack()
+        for item in ('调整房间灯光', '站起来接温水或其他饮品', '给电脑接线', '带耳机播放工作 BGM'):
+            tk.Checkbutton(dialog, text=item, bg=CREAM, font=(FONT, 10), anchor='w').pack(fill='x', padx=38)
+        deadline = __import__('time').monotonic() + 180
+
+        def tick():
+            if not dialog.winfo_exists():
+                return
+            left = max(0, math.ceil(deadline - __import__('time').monotonic()))
+            countdown.config(text=f'{left//60:02d}:{left%60:02d}')
+            if left:
+                dialog.after(250, tick)
+            else:
+                dialog.destroy()
+                self.preparation = None
+                self.start_recommended_intercept()
+        tick()
+
+    def start_recommended_intercept(self):
+        if self.timer and self.timer.winfo_exists():
+            self.open_timer()
+            return
+        self.replan()
+        task, block = self.recommended()
+        if not task:
+            self.status.set('准备已结束；当前没有可推荐任务，请新增待办或手动选择。')
+            self.show()
+            return
+        minutes = min(self.cfg['work'], remaining(task))
+        active = dict(task_id=task['id'], session_id=uid(), phase='work', round=0,
+                      total_seconds=minutes*60, elapsed_seconds=0, start=iso(now()), note='', running=True)
+        self.data['active'] = active
+        self.timer = FloatTimer(self, active)
+        self.timer.clock.start()
+        self.replan()
 
     def log_work(self, task, active, minutes, note, completed):
         if minutes <= 0:
@@ -1183,11 +1406,17 @@ class App(tk.Tk):
         lb.pack()
         def refresh():
             lb.delete(0, 'end')
-            for e in self.data['events']:
+            for e in [*self.data['events'], *self.courses]:
                 day = e.get('date') or ('每周 ' + ','.join(str(i+1) for i in e.get('weekdays', [])))
-                lb.insert('end', f'{day}  {e["start"]}–{e["end"]}  {e.get("title", e.get("name", "固定日程"))}')
+                suffix = '  ·  Google 课表' if e.get('course') else ''
+                lb.insert('end', f'{day}  {e["start"]}–{e["end"]}  {e.get("title", e.get("name", "固定日程"))}{suffix}')
+                if suffix:
+                    lb.itemconfigure('end', foreground='#98620B')
         def edit(add=False):
             sel = lb.curselection()
+            if not add and sel and sel[0] >= len(self.data['events']):
+                mb.showinfo('Google 课表', '请在 Google 日历中调整这节课。', parent=win)
+                return
             e = None if add else self.data['events'][sel[0]] if sel else None
             if not add and e is None:
                 return
@@ -1203,6 +1432,9 @@ class App(tk.Tk):
             win.grab_set()
         def delete():
             sel = lb.curselection()
+            if sel and sel[0] >= len(self.data['events']):
+                mb.showinfo('Google 课表', '请在 Google 日历中调整这节课。', parent=win)
+                return
             if sel and mb.askyesno('删除固定日程', '删除这个固定日程？', parent=win):
                 self.data['events'].pop(sel[0])
                 refresh()
@@ -1249,7 +1481,7 @@ class App(tk.Tk):
                 pin = dict(id=uid(), task_id=block['task_id'], start=iso(start), end=iso(end))
                 candidate = copy.deepcopy(self.data)
                 candidate['pins'].append(pin)
-                plan = schedule(candidate)
+                plan = schedule(candidate, courses=self.courses)
                 if not any(b.get('id') == pin['id'] for b in plan['blocks']):
                     raise ValueError('这个时段不满足可用时间、截止日期、前置任务或休息约束；请选择其他时间')
                 self.data['pins'].append(pin)
@@ -1305,6 +1537,8 @@ class App(tk.Tk):
             self.tray = None
 
     def poll_actions(self):
+        if self.bridge:
+            self.bridge.poll()
         while not self.actions.empty():
             action = self.actions.get_nowait()
             if action == 'show':
@@ -1327,6 +1561,8 @@ class App(tk.Tk):
             self.quit_app()
 
     def quit_app(self):
+        if self.bridge:
+            self.bridge.close()
         if self.notion_worker:
             self.notion.stop.set()
             self.notion_worker.shutdown(wait=False, cancel_futures=True)
@@ -1352,6 +1588,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Parcel desktop planner')
     parser.add_argument('--data-file', help='Use a separate local data file')
+    parser.add_argument('--timer', action='store_true', help='Open the floating recommended timer directly')
     args = parser.parse_args()
     mutex = None
     if sys.platform == 'win32':
@@ -1361,7 +1598,10 @@ def main():
             mb.showinfo('Parcel 已在运行', '请从任务栏或右下角托盘打开 Parcel。')
             return
     try:
-        app = App(Store(args.data_file) if args.data_file else None)
+        app = App(Store(args.data_file) if args.data_file else None, timer_only=args.timer)
+        if args.timer:
+            app.withdraw()
+            app.after(0, lambda: app.open_timer() if app.timer else app.start_recommended_intercept())
         app.mainloop()
     except Exception:
         (BASE/'data').mkdir(exist_ok=True)
