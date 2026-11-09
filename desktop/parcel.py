@@ -220,7 +220,10 @@ class TaskDialog(Dialog):
         self.dependencies.configure(yscrollcommand=sb.set)
         self.dependencies.pack(side='left', fill='x', expand=True)
         sb.pack(side='right', fill='y')
-        self.options = [a for a in data['tasks'] if not task or a['id'] != task['id']]
+        if task:
+            self.options = [a for a in data['tasks'] if a['id'] != task['id']]
+        else:
+            self.options = [a for a in data['tasks'] if remaining(a) > 0]
         for i, a in enumerate(self.options):
             self.dependencies.insert('end', ('✓ ' if a.get('done') else '') + a['title'])
             if a['id'] in t.get('dependencies', []):
@@ -756,11 +759,11 @@ class App(tk.Tk):
         actions = frame(self, CREAM)
         actions.pack(fill='x', padx=26, pady=(8, 8))
         for text, command, accent in [('打开番茄钟', self.open_timer, True), ('新增待办', self.add_task, False),
-                                      ('大类设置', self.add_category, False), ('固定日程', self.events_window, False),
-                                      ('计时 / 排程设置', self.settings, False)]:
+                                      ('大类设置', self.add_category, False), ('固定日程', self.events_window, False)]:
             button(actions, text, command, accent=accent).pack(side='left', padx=(0, 8))
         more = tk.Menubutton(actions, text='更多 ▾', bg=CREAM, fg=GREEN, font=(FONT, 10), relief='flat', padx=10, pady=7)
         menu = tk.Menu(more, tearoff=False)
+        menu.add_command(label='计时 / 排程设置', command=self.settings)
         menu.add_command(label='工作规则', command=self.rules_window)
         menu.add_command(label='快捷文字录入（本地识别）', command=self.quick_add)
         menu.add_command(label='备份全部数据…', command=self.export)
@@ -799,11 +802,17 @@ class App(tk.Tk):
 
         self.panes = tk.PanedWindow(self, orient='horizontal', bg=CREAM, bd=0, sashwidth=10, sashrelief='flat')
         self.panes.pack(fill='both', expand=True, padx=26)
-        plan_panel, task_panel, history_panel = [frame(self.panes) for _ in range(3)]
+        plan_slot = frame(self.panes, CREAM)
+        task_panel, history_panel = [frame(self.panes) for _ in range(2)]
         panel_space = width - 72  # Side margins and both dividers.
-        for panel, share, minimum in [(plan_panel, .38, 260), (task_panel, .35, 235), (history_panel, .27, 180)]:
+        for panel, share, minimum in [(plan_slot, .38, 260), (task_panel, .35, 235), (history_panel, .27, 180)]:
             panel_width = round(panel_space * share)
             self.panes.add(panel, minsize=min(minimum, panel_width), width=panel_width, stretch='always')
+        plan_slot.pack_propagate(False)
+        plan_panel = frame(plan_slot)
+        plan_panel.pack(fill='both', expand=True)
+        expand_plan = button(plan_slot, '展开排程 ▸',
+                             lambda: self.toggle_plan_panel(plan_panel, expand_plan), small=True)
         task_head = frame(task_panel)
         task_head.pack(fill='x', padx=16, pady=(15, 8))
         label(task_head, '待办事项', size=15, bold=True).pack(side='left')
@@ -832,6 +841,8 @@ class App(tk.Tk):
         self.history_area.pack(fill='both', expand=True, padx=12, pady=(8, 10))
         head = frame(plan_panel)
         head.pack(fill='x', padx=16, pady=(15, 8))
+        button(head, '◂', lambda: self.toggle_plan_panel(plan_panel, expand_plan),
+               subtle=True, small=True).pack(side='left', padx=(0, 4))
         label(head, '自动排程', size=15, bold=True).pack(side='left')
         button(head, '重新安排', self.replan, subtle=True).pack(side='right')
         self.preferences = {}
@@ -864,6 +875,15 @@ class App(tk.Tk):
         footer.pack(fill='x', padx=26, pady=(6, 8))
         button(footer, '问题与反馈', self.feedback_window, subtle=True).pack(side='right')
         label(footer, textvariable=self.status, size=9, color=MUTED, anchor='w').pack(side='left', fill='x', expand=True)
+
+    @staticmethod
+    def toggle_plan_panel(panel, expand):
+        if panel.winfo_manager():
+            panel.pack_forget()
+            expand.pack(anchor='nw', padx=8, pady=(15, 0))
+        else:
+            expand.pack_forget()
+            panel.pack(fill='both', expand=True)
 
     def feedback_window(self):
         d = Dialog(self, '问题与反馈')
@@ -1220,20 +1240,40 @@ class App(tk.Tk):
     def add_category(self):
         d = Dialog(self, '大类设置')
         categories = self.data['categories']
-        priorities = self.data.setdefault('category_priorities', {})
-        name = d.field('选择或输入大类', '', categories)
+        priorities = self.data.get('category_priorities', {})
+        existing = d.field('现有大类（留空可新增）', '', ['', *categories])
+        existing.configure(state='readonly')
+        name = d.field('大类名称')
         priority = d.field('优先级（5 最高）', 3, [1, 2, 3, 4, 5])
         priority.configure(state='readonly')
-        name.bind('<<ComboboxSelected>>', lambda event: priority.set(priorities.get(name.get(), 3)))
+
+        def select_category(event):
+            previous = existing.get()
+            name.delete(0, 'end')
+            name.insert(0, previous)
+            priority.set(priorities.get(previous, 3))
+
+        existing.bind('<<ComboboxSelected>>', select_category)
 
         def save():
+            previous = existing.get()
             category = name.get().strip()
             if not category:
                 mb.showwarning('大类设置', '请输入大类名称。', parent=d)
                 return
-            if category not in categories:
+            if category != previous and category in categories:
+                mb.showwarning('大类设置', '这个名称已存在，请选择其他名称。', parent=d)
+                return
+            if not previous:
                 categories.append(category)
+            elif previous != category:
+                categories[categories.index(previous)] = category
+                priorities.pop(previous, None)
+                for task in self.data['tasks']:
+                    if task.get('category') == previous:
+                        task['category'] = category
             priorities[category] = int(priority.get())
+            self.data['category_priorities'] = priorities
             d.destroy()
             self.replan()
             self.status.set(f'已保存大类：{category}')
